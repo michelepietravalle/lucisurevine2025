@@ -1,12 +1,12 @@
 /*
- badge_software.ino (v24c-peer-bursts-5percent-smoothfade)
+ badge_software.ino (v24c-peer-bursts-5percent-smootherfade-gamma)
 
  - Peer mode: pulsazione sincronizzata a 1.00 s, ordine SEQ uguale per tutti.
- - Cambio colori lento ~3.2 s in peer, con cross-fade più dolce (easing smoothstep).
- - Flash bianco post-blackout all'8% (sempre).
+ - Colore: cross-fade più dolce (smootherstep), durate: solo 300 ms, peer 500 ms.
+ - Intensità: correzione gamma percettiva (gamma 2.2) per transizioni più morbide.
+ - Blackout casuale: durata 2.0 s, probabilità ~5% (per ciclo).
+ - Nuovo peer: burst di colpi; ciascuno = blackout 0.3 s + flash bianco 8%; numero colpi = peer presenti all’arrivo.
  - Luminosità colori ridotta del 25% SOLO in peer mode.
- - Nuovo peer: lampeggia (blackout+flash) per un numero di volte pari ai peer presenti al momento dell'arrivo.
- - Blackout casuale al 5% (per ciclo), disabilitato durante burst nuovo peer.
  - Rielezione leader, LED_PHASE_OFFSET_ENABLED = true.
 */
 
@@ -90,27 +90,29 @@ const float SWEEP_MIX        = 1.00f;
 // Bloom
 const uint32_t BLOOM_DURATION_MS = 600;
 
-// Cross-fade palette (solo / peer) — aumentati per transizioni più dolci
-const uint16_t CROSS_FADE_MS_SOLO = 220; // prima 150
-const uint16_t CROSS_FADE_MS_PEER = 320; // prima 70
+// Cross-fade palette (solo / peer) — più dolci
+const uint16_t CROSS_FADE_MS_SOLO = 300; // prima 220
+const uint16_t CROSS_FADE_MS_PEER = 500; // prima 320
 
 // Blackout casuale (deterministico per ciclo)
-const uint8_t  BLACKOUT_PROB        = 13;   // ~5% su 256
-const uint16_t BLACKOUT_DURATION_MS = 120;
+const uint8_t  BLACKOUT_PROB        = 13;     // ~5% su 256
+const uint16_t BLACKOUT_DURATION_MS = 2000;   // 2 s
 
 // Blackout nuovo peer (burst)
 #define BLACKOUT_NEW_PEER_ENABLED 1
-const uint16_t BLACKOUT_NEW_PEER_DURATION_MS = 150;
+const uint16_t BLACKOUT_NEW_PEER_DURATION_MS = 300;  // 0.3 s
 const bool     NEW_PEER_BLACKOUT_EXTEND      = true;
-const uint16_t NEW_PEER_BURST_GAP_MS         = 60;  // pausa tra colpi della burst
+const uint16_t NEW_PEER_BURST_GAP_MS         = 60;   // pausa tra colpi della burst
 
-// Flash bianco post-blackout
-#define POST_FLASH_ENABLED 1
-const uint16_t POST_FLASH_DURATION_MS     = 130;
-const float    POST_FLASH_FIXED_INTENSITY = 0.08f; // 8%
+// Flash bianco per burst nuovo peer
+const uint16_t NEW_PEER_FLASH_DURATION_MS = 130;
+const float    NEW_PEER_FLASH_INTENSITY   = 0.08f; // 8%
 
 // Scala luminosità colori in peer mode (ridotta del 25%)
 const float COLOR_BRIGHTNESS_SCALE = 0.75f; // solo in peer mode
+
+// Correzione gamma percettiva per l'intensità
+const float BRIGHTNESS_GAMMA = 2.2f;
 
 // Phase offset per LED
 const bool LED_PHASE_OFFSET_ENABLED = true;
@@ -210,20 +212,20 @@ inline uint32_t prngNext(){
   uint32_t x=prngState; x^=x<<13; x^=x>>17; x^=x<<5; prngState=x; return x;
 }
 
-// Blackout / flash
+// Blackout / flash (runtime)
 bool     blackoutScheduled=false;
 float    blackoutPhase=0.0f;
 bool     blackoutActive=false;
 uint32_t blackoutEndMs=0;
 
-bool     postFlashActive=false;
-uint32_t postFlashStartMs=0;
-uint32_t postFlashEndMs=0;
-
 // Burst nuovo peer
 bool     newPeerBurstActive=false;
 uint8_t  newPeerBurstRemaining=0;
 uint32_t newPeerNextStartMs=0;
+
+// Flash bianco per nuovo peer
+bool     npFlashActive=false;
+uint32_t npFlashEndMs=0;
 
 // ---------- Forward declarations ----------
 void setupAdvertising();
@@ -238,8 +240,6 @@ bool computeNeighborPhaseMean(float& outPhase);
 void updateDynamicPeriods(uint8_t peerCount);
 void reevaluateLeaderIfNeeded(uint32_t nowMs);
 void scheduleBlackoutForCycle();
-void startPostFlash(uint32_t now);
-void updatePostFlash(uint32_t now);
 void advanceColorCycle(uint32_t nowMs);
 void adoptColorCycle(uint32_t newCycle,uint32_t nowMs);
 void startNewCycleFade(uint32_t nowMs);
@@ -329,11 +329,18 @@ uint8_t hueLerpCircular(uint8_t a,uint8_t b,float t){
   return (uint8_t)v;
 }
 
-// Easing morbida per cross-fade (smoothstep)
-static inline float easeSmoothstep(float t){
+// Easing quintica “smootherstep” per transizioni molto morbide
+static inline float easeSmootherstep(float t){
   if(t<=0) return 0.0f;
   if(t>=1) return 1.0f;
-  return t*t*(3.0f - 2.0f*t);
+  return t*t*t*(t*(t*6.0f - 15.0f) + 10.0f);
+}
+
+// Correzione gamma su frazione 0..1 => 0..255
+static inline uint8_t gammaU8(float x){
+  if(x <= 0.0f) return 0;
+  if(x >= 1.0f) return 255;
+  return (uint8_t)lroundf(powf(x, BRIGHTNESS_GAMMA) * 255.0f);
 }
 
 // ---------- Palette ----------
@@ -377,25 +384,11 @@ void triggerNewPeerBlackout(uint32_t now){
   newPeerBurstRemaining += pc;
 
   // Se siamo liberi, lancia subito il prossimo blackout
-  if(!blackoutActive && !postFlashActive && now >= newPeerNextStartMs){
+  if(!blackoutActive && !npFlashActive && now >= newPeerNextStartMs){
     blackoutActive = true;
     blackoutEndMs  = now + BLACKOUT_NEW_PEER_DURATION_MS;
     if(newPeerBurstRemaining>0) newPeerBurstRemaining--;
   }
-#endif
-}
-
-// ---------- Post Flash ----------
-void startPostFlash(uint32_t now){
-#if POST_FLASH_ENABLED
-  postFlashActive=true;
-  postFlashStartMs=now;
-  postFlashEndMs=now + POST_FLASH_DURATION_MS;
-#endif
-}
-void updatePostFlash(uint32_t now){
-#if POST_FLASH_ENABLED
-  if(postFlashActive && now>=postFlashEndMs) postFlashActive=false;
 #endif
 }
 
@@ -438,8 +431,8 @@ void updateFade(uint32_t nowMs, uint8_t peerCount){
     for(int i=0;i<NUM_LEDS;i++) currentHueDisplay[i]=targetCycleHue[i];
     return;
   }
-  // Easing smoothstep per transizione più dolce
-  float te = easeSmoothstep(t);
+  // Easing smootherstep per transizione più dolce
+  float te = easeSmootherstep(t);
   for(int i=0;i<NUM_LEDS;i++){
     currentHueDisplay[i]=hueLerpCircular(prevCycleHue[i], targetCycleHue[i], te);
   }
@@ -727,9 +720,12 @@ void updateLeds(uint32_t nowMs, float dt){
 
   updateFade(nowMs, peerCount);
 
-  // Blackout ciclico (disattivato durante burst nuovo peer)
+  // Aggiorna stato flash nuovo peer
+  if(npFlashActive && nowMs >= npFlashEndMs) npFlashActive=false;
+
+  // Blackout ciclico (disattivato durante burst nuovo peer o flash in corso)
   if(!soloMode){
-    if(!newPeerBurstActive && blackoutScheduled && !blackoutActive){
+    if(!newPeerBurstActive && !npFlashActive && blackoutScheduled && !blackoutActive){
       bool crossed=false;
       if(prevPhase <= blackoutPhase){
         if(fireflyPhase >= blackoutPhase) crossed=true;
@@ -741,22 +737,23 @@ void updateLeds(uint32_t nowMs, float dt){
         blackoutEndMs=nowMs + BLACKOUT_DURATION_MS;
       }
     }
+    // Termine blackout
     if(blackoutActive && nowMs >= blackoutEndMs){
       blackoutActive=false;
-      startPostFlash(nowMs);
-      // Se siamo in burst nuovo peer, programma il prossimo colpo
+      // Se siamo in burst nuovo peer, avvia il flash bianco e programma il prossimo colpo
       if(newPeerBurstActive){
-        newPeerNextStartMs = postFlashEndMs + NEW_PEER_BURST_GAP_MS;
+        npFlashActive = true;
+        npFlashEndMs  = nowMs + NEW_PEER_FLASH_DURATION_MS;
+        newPeerNextStartMs = npFlashEndMs + NEW_PEER_BURST_GAP_MS;
       }
     }
   } else {
-    if(blackoutActive){ blackoutActive=false; startPostFlash(nowMs); }
+    if(blackoutActive){ blackoutActive=false; }
   }
-  updatePostFlash(nowMs);
 
   // Pianifica successivi colpi della burst nuovo peer
   if(newPeerBurstActive){
-    if(!blackoutActive && !postFlashActive){
+    if(!blackoutActive && !npFlashActive){
       if(newPeerBurstRemaining>0 && nowMs >= newPeerNextStartMs){
         blackoutActive=true;
         blackoutEndMs=nowMs + BLACKOUT_NEW_PEER_DURATION_MS;
@@ -784,8 +781,8 @@ void updateLeds(uint32_t nowMs, float dt){
     uint32_t out=0;
     if(blackoutActive){
       out=0;
-    } else if(postFlashActive){
-      uint8_t v=(uint8_t)lroundf(POST_FLASH_FIXED_INTENSITY * 255.0f);
+    } else if(npFlashActive){
+      uint8_t v=(uint8_t)lroundf(NEW_PEER_FLASH_INTENSITY * 255.0f);
       out = strip.Color(v,v,v);
     } else {
       float valFrac=0.0f;
@@ -816,8 +813,10 @@ void updateLeds(uint32_t nowMs, float dt){
       uint8_t baseHue = soloMode ? coldHueCurrent[i] : currentHueDisplay[i];
       uint16_t hue16 = (uint16_t)baseHue * 257;
 
+      // Scala luminosità (peer mode 0.75) e applica gamma per transizione d'intensità più morbida
       float brightnessScale = soloMode ? 1.0f : COLOR_BRIGHTNESS_SCALE;
-      uint8_t  V=(uint8_t)lroundf(valFrac * brightnessScale * 255.0f);
+      float vLinear = valFrac * brightnessScale;
+      uint8_t V = gammaU8(vLinear);
 
       out=strip.ColorHSV(hue16, 255, V);
     }
@@ -835,7 +834,7 @@ void updateLeds(uint32_t nowMs, float dt){
     Serial.print("s color="); Serial.print(colorCyclePeriodCurrentSec,2);
     Serial.print("s peak="); Serial.print(smoothedPeak,2);
     Serial.print(" blackout="); Serial.print(blackoutActive);
-    Serial.print(" flash="); Serial.print(postFlashActive);
+    Serial.print(" npFlash="); Serial.print(npFlashActive);
     Serial.print(" npBurst="); Serial.print(newPeerBurstActive);
     Serial.print("/"); Serial.print(newPeerBurstRemaining);
     Serial.println();
