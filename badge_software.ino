@@ -1,26 +1,13 @@
 /*
- badge_warm_pulse_sync_ordered_v23.ino
+ badge_software.ino (v24c-peer-bursts-5percent-smoothfade)
 
- Obiettivi:
- - Più movimento in presenza di peer:
-    * Periodi minimi più rapidi (pulsazione & cambio colori)
-    * Shimmer globale & per-pixel (solo peer mode)
-    * Micro-sparkle controllato (solo peer mode)
-    * Phase drift lento per LED (solo peer mode)
-    * Leggero hue wobble (solo peer mode)
-    * Cross-fade palette più veloce in peer mode
- - Mantiene fading 0 -> picco -> 0, nessuna baseline luminosa artificiale.
- - Flash bianco post-blackout al 20%.
-
- NOTE:
- - LED_PHASE_OFFSET_ENABLED forzato a true (richiesta utente).
- - In solo mode tutto rimane morbido e lento come nelle versioni precedenti recenti.
-
- Tuning rapido:
- - Rendere ancora più veloce: abbassa PULSE_PERIOD_MIN_SEC_PEER / COLOR_CYCLE_PERIOD_MIN_SEC_PEER
- - Più vibrazione colore: aumenta HUE_WOBBLE_MAX
- - Eliminare micro-sparkle: ENABLE_PEER_MICRO_SPARKLE = false
- - Eliminare drift: ENABLE_PEER_PHASE_DRIFT = false
+ - Peer mode: pulsazione sincronizzata a 1.00 s, ordine SEQ uguale per tutti.
+ - Cambio colori lento ~3.2 s in peer, con cross-fade più dolce (easing smoothstep).
+ - Flash bianco post-blackout all'8% (sempre).
+ - Luminosità colori ridotta del 25% SOLO in peer mode.
+ - Nuovo peer: lampeggia (blackout+flash) per un numero di volte pari ai peer presenti al momento dell'arrivo.
+ - Blackout casuale al 5% (per ciclo), disabilitato durante burst nuovo peer.
+ - Rielezione leader, LED_PHASE_OFFSET_ENABLED = true.
 */
 
 #include <Arduino.h>
@@ -43,7 +30,7 @@
 // Logging
 const uint32_t STATUS_LOG_INTERVAL_MS = 2000;
 
-// Presence / RSSI
+// Presenza / RSSI
 const uint32_t BEACON_TIMEOUT_MS    = 4000;
 const int8_t   RSSI_MIN_DBM         = -100;
 const int8_t   RSSI_MAX_DBM         = -45;
@@ -54,28 +41,25 @@ const uint8_t  PEERS_FOR_FULL_SCALE = 3;
 // Protocol
 const uint8_t  PROTO_VERSION = 6;
 
-// Cold hues (solo mode)
+// Solo-mode cold hues
 const uint8_t  COLD_MIN_HUE = 140;
 const uint8_t  COLD_MAX_HUE = 200;
 
-// Hue coupling
+// Residual hue coupling
 const float GROUP_HUE_COUPLING = 0.055f;
 
-// Vivacità saturazione
-const uint8_t MAX_PEER_ACCEL_PEERS = 6;
-
-// Periodi dinamici (SOLO MODE min)
+// Periodi pulsazione (solo/peer)
 const float PULSE_PERIOD_MAX_SEC_SOLO = 3.0f;
 const float PULSE_PERIOD_MIN_SEC_SOLO = 1.20f;
+const float PULSE_PERIOD_PEER_SEC     = 1.00f; // forzato con >=2 peer
+
+// Periodi cambio colori (solo/peer)
 const float COLOR_CYCLE_PERIOD_MAX_SEC_SOLO = 3.0f;
 const float COLOR_CYCLE_PERIOD_MIN_SEC_SOLO = 1.50f;
+const float COLOR_CYCLE_PERIOD_PEER_SEC     = 3.20f; // ~3–4 s
 
-// Periodi dinamici (PEER MODE min più veloci)
-const float PULSE_PERIOD_MIN_SEC_PEER       = 0.75f;
-const float COLOR_CYCLE_PERIOD_MIN_SEC_PEER = 0.80f;
-
-// Smoothing
-const float PULSE_PERIOD_SMOOTH_ALPHA       = 0.25f;
+// Smoothing dinamico
+const float PULSE_PERIOD_SMOOTH_ALPHA       = 0.35f; // aggancio rapido
 const float COLOR_CYCLE_PERIOD_SMOOTH_ALPHA = 0.25f;
 
 // Frame / adv
@@ -87,68 +71,63 @@ const float PEAK_SMOOTH_ALPHA           = 0.06f;
 const float PEAK_SMOOTH_ALPHA_FALL_MULT = 2.6f;
 
 // Peak targets
-const float ZERO_PEER_PEAK = 0.40f;
-const float PEAK_SCALE_MAX = 1.25f;
+const float ZERO_PEER_PEAK = 0.45f;
+const float PEAK_SCALE_MAX = 1.10f; // clamp a valle
 
-// Shimmer & movement toggles
-const bool  ENABLE_PEER_GLOBAL_SHIMMER = true;
-const float PEER_GLOBAL_SHIMMER_DEPTH  = 0.09f;
+// Disattiva elementi che rompono la sincronia in peer mode
+const bool  ENABLE_PEER_GLOBAL_SHIMMER = false;
+const bool  ENABLE_PEER_PIXEL_SHIMMER  = false;
+const bool  ENABLE_PEER_MICRO_SPARKLE  = false;
+const bool  ENABLE_PEER_PHASE_DRIFT    = false;
+const bool  ENABLE_HUE_WOBBLE          = false;
 
-const bool  ENABLE_PEER_PIXEL_SHIMMER  = true;
-const float PEER_PIXEL_SHIMMER_DEPTH   = 0.18f;
-const float SHIMMER_PHASE_SPREAD       = 1.7f;
-const float SHIMMER_FREQ_MULT          = 2.15f;
-
-// Micro-sparkle
-const bool  ENABLE_PEER_MICRO_SPARKLE = true;
-const float PEER_MICRO_SPARKLE_MAX    = 0.10f;
-const float SPARKLE_WAVE_THRESHOLD    = 0.15f;
-
-// Phase drift per LED
-const bool     ENABLE_PEER_PHASE_DRIFT = true;
-const uint32_t PHASE_DRIFT_INTERVAL_MS = 1800;
-const float    PHASE_DRIFT_MAX_DELTA   = 0.035f; // massimo offset addizionale
-// Hue wobble
-const bool  ENABLE_HUE_WOBBLE = true;
-const uint8_t HUE_WOBBLE_MAX  = 6; // ±6
+// Sweep progressivo (peer mode)
+const float SWEEP_SPEED_MULT = 1.00f;
+const float SWEEP_WIDTH      = 0.42f;
+const int   SWEEP_COUNT      = 1;
+const float SWEEP_MIX        = 1.00f;
 
 // Bloom
 const uint32_t BLOOM_DURATION_MS = 600;
 
-// Cross-fade palette (solo / peer)
-const uint16_t CROSS_FADE_MS_SOLO = 150;
-const uint16_t CROSS_FADE_MS_PEER = 90;
+// Cross-fade palette (solo / peer) — aumentati per transizioni più dolci
+const uint16_t CROSS_FADE_MS_SOLO = 220; // prima 150
+const uint16_t CROSS_FADE_MS_PEER = 320; // prima 70
 
-// Blackout
-const uint8_t  BLACKOUT_PROB        = 85;  // ~33%
+// Blackout casuale (deterministico per ciclo)
+const uint8_t  BLACKOUT_PROB        = 13;   // ~5% su 256
 const uint16_t BLACKOUT_DURATION_MS = 120;
 
-// Blackout nuovo peer
+// Blackout nuovo peer (burst)
 #define BLACKOUT_NEW_PEER_ENABLED 1
 const uint16_t BLACKOUT_NEW_PEER_DURATION_MS = 150;
 const bool     NEW_PEER_BLACKOUT_EXTEND      = true;
+const uint16_t NEW_PEER_BURST_GAP_MS         = 60;  // pausa tra colpi della burst
 
 // Flash bianco post-blackout
 #define POST_FLASH_ENABLED 1
 const uint16_t POST_FLASH_DURATION_MS     = 130;
-const float    POST_FLASH_FIXED_INTENSITY = 0.20f; // 20%
+const float    POST_FLASH_FIXED_INTENSITY = 0.08f; // 8%
 
-// Phase offset per LED: utente vuole attivo
+// Scala luminosità colori in peer mode (ridotta del 25%)
+const float COLOR_BRIGHTNESS_SCALE = 0.75f; // solo in peer mode
+
+// Phase offset per LED
 const bool LED_PHASE_OFFSET_ENABLED = true;
 
-// Cold color jitter solo mode
+// Solo mode cold color jitter
 const uint32_t ZERO_PEER_BASE_INTERVAL_MS = 3000;
 const uint32_t ZERO_PEER_COLOR_JITTER_MS  = 900;
 
-// Sequenza
+// Sequenza fissa (ordine sincronizzato)
 static const int SEQ[NUM_LEDS] = {0,2,4,6,1,3,5};
 
 // Strutture
 struct LedState {
   float baseOffset;
-  float driftOffset;    // aggiornato nel tempo
+  float driftOffset;
   uint32_t nextDriftUpdate;
-  uint32_t seed;        // per wobble e drift
+  uint32_t seed;
 };
 
 struct BadgePeer {
@@ -163,10 +142,10 @@ struct BadgePeer {
   uint8_t  peerID=0;
 };
 
+// Stato globale
 static const uint8_t MAX_PEERS=16;
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-// Stato
 LedState  ledStates[NUM_LEDS];
 BadgePeer peers[MAX_PEERS];
 
@@ -196,8 +175,7 @@ float neighborMeanPhase=0.0f;
 uint32_t bloomEndMs=0;
 bool     bloomActive=false;
 
-uint8_t  groupHueLocal=170;
-uint8_t  groupHueTarget=170;
+uint8_t  groupHueLocal=170, groupHueTarget=170;
 uint32_t lastSoloHueDriftMs=0;
 
 BLEAdvertising* gAdv=nullptr;
@@ -213,9 +191,12 @@ uint8_t prevCycleHue[NUM_LEDS];
 uint8_t targetCycleHue[NUM_LEDS];
 uint8_t currentHueDisplay[NUM_LEDS];
 uint32_t lastCycleChangeMs=0;
-bool fadeActive=false;
+bool     fadeActive=false;
 
-// PRNG
+// Rank per sweep progressivo
+uint8_t rankOfLed[NUM_LEDS];
+
+// PRNG (solo per palette deterministica)
 static uint32_t prngState=0;
 inline void prngSeed(uint32_t s){
   prngState = s ^ 0x9E3779B9u;
@@ -239,7 +220,33 @@ bool     postFlashActive=false;
 uint32_t postFlashStartMs=0;
 uint32_t postFlashEndMs=0;
 
-// --- Utility ---
+// Burst nuovo peer
+bool     newPeerBurstActive=false;
+uint8_t  newPeerBurstRemaining=0;
+uint32_t newPeerNextStartMs=0;
+
+// ---------- Forward declarations ----------
+void setupAdvertising();
+void updateAdvertisingData(bool force=false);
+void setupContinuousScan();
+void initLeds();
+void updateLeds(uint32_t nowMs, float dt);
+void updateSoloColdColors(uint32_t now);
+void leaderColorCycleTimer(uint32_t nowMs, bool peerMode);
+void updateGroupHue(uint8_t peerCount);
+bool computeNeighborPhaseMean(float& outPhase);
+void updateDynamicPeriods(uint8_t peerCount);
+void reevaluateLeaderIfNeeded(uint32_t nowMs);
+void scheduleBlackoutForCycle();
+void startPostFlash(uint32_t now);
+void updatePostFlash(uint32_t now);
+void advanceColorCycle(uint32_t nowMs);
+void adoptColorCycle(uint32_t newCycle,uint32_t nowMs);
+void startNewCycleFade(uint32_t nowMs);
+uint16_t currentCrossFadeMs(uint8_t peerCount);
+void computeTargetPalette();
+
+// ---------- Utility ----------
 uint8_t rand8range(uint8_t a,uint8_t b){ return a + (uint8_t)(esp_random() % (b - a + 1)); }
 
 int findPeerSlot(const BLEAddress& a){
@@ -322,7 +329,14 @@ uint8_t hueLerpCircular(uint8_t a,uint8_t b,float t){
   return (uint8_t)v;
 }
 
-// --- Palette ---
+// Easing morbida per cross-fade (smoothstep)
+static inline float easeSmoothstep(float t){
+  if(t<=0) return 0.0f;
+  if(t>=1) return 1.0f;
+  return t*t*(3.0f - 2.0f*t);
+}
+
+// ---------- Palette ----------
 void computeTargetPalette(){
   uint8_t idx[NUM_LEDS];
   for(int i=0;i<NUM_LEDS;i++) idx[i]=i;
@@ -336,12 +350,10 @@ void computeTargetPalette(){
 
 uint16_t currentCrossFadeMs(uint8_t peerCount){
   if(peerCount==0) return CROSS_FADE_MS_SOLO;
-  float factor = (peerCount >= MAX_PEER_ACCEL_PEERS)?1.0f:(float)peerCount/MAX_PEER_ACCEL_PEERS;
-  // Interp tra solo e peer
-  return (uint16_t)lroundf(CROSS_FADE_MS_SOLO + (CROSS_FADE_MS_PEER - CROSS_FADE_MS_SOLO)*factor);
+  return CROSS_FADE_MS_PEER;
 }
 
-// --- Blackout scheduling ---
+// ---------- Blackout scheduling ----------
 void scheduleBlackoutForCycle(){
   uint32_t h = warmColorCycle * 2654435761u;
   h ^= (h >> 13);
@@ -355,20 +367,25 @@ void scheduleBlackoutForCycle(){
   blackoutActive=false;
 }
 
-// --- Blackout nuovo peer ---
+// ---------- Blackout nuovo peer (burst) ----------
 void triggerNewPeerBlackout(uint32_t now){
 #if BLACKOUT_NEW_PEER_ENABLED
-  if(!blackoutActive){
-    blackoutActive=true;
-    blackoutEndMs=now + BLACKOUT_NEW_PEER_DURATION_MS;
-  } else if(NEW_PEER_BLACKOUT_EXTEND){
-    uint32_t proposed=now + BLACKOUT_NEW_PEER_DURATION_MS;
-    if(proposed>blackoutEndMs) blackoutEndMs=proposed;
+  uint8_t pc = countValidPeers(); // include il nuovo peer già marcato valido
+  if(pc==0) return;
+  // Attiva/accoda una burst con un numero di colpi pari ai peer presenti
+  newPeerBurstActive = true;
+  newPeerBurstRemaining += pc;
+
+  // Se siamo liberi, lancia subito il prossimo blackout
+  if(!blackoutActive && !postFlashActive && now >= newPeerNextStartMs){
+    blackoutActive = true;
+    blackoutEndMs  = now + BLACKOUT_NEW_PEER_DURATION_MS;
+    if(newPeerBurstRemaining>0) newPeerBurstRemaining--;
   }
 #endif
 }
 
-// --- Post Flash ---
+// ---------- Post Flash ----------
 void startPostFlash(uint32_t now){
 #if POST_FLASH_ENABLED
   postFlashActive=true;
@@ -382,7 +399,7 @@ void updatePostFlash(uint32_t now){
 #endif
 }
 
-// --- Cycle transitions ---
+// ---------- Cycle transitions ----------
 void startNewCycleFade(uint32_t nowMs){
   for(int i=0;i<NUM_LEDS;i++) prevCycleHue[i]=currentHueDisplay[i];
   computeTargetPalette();
@@ -421,32 +438,57 @@ void updateFade(uint32_t nowMs, uint8_t peerCount){
     for(int i=0;i<NUM_LEDS;i++) currentHueDisplay[i]=targetCycleHue[i];
     return;
   }
+  // Easing smoothstep per transizione più dolce
+  float te = easeSmoothstep(t);
   for(int i=0;i<NUM_LEDS;i++){
-    currentHueDisplay[i]=hueLerpCircular(prevCycleHue[i], targetCycleHue[i], t);
+    currentHueDisplay[i]=hueLerpCircular(prevCycleHue[i], targetCycleHue[i], te);
   }
 }
 
-// --- Periodi dinamici ---
-void updateDynamicPeriods(uint8_t peerCount){
-  float factor=(peerCount >= MAX_PEER_ACCEL_PEERS)?1.0f:(float)peerCount/MAX_PEER_ACCEL_PEERS;
-
-  // Pulsazione
-  float pulseMin = (peerCount==0) ? PULSE_PERIOD_MIN_SEC_SOLO : PULSE_PERIOD_MIN_SEC_PEER;
-  float pulseTarget = PULSE_PERIOD_MAX_SEC_SOLO + (pulseMin - PULSE_PERIOD_MAX_SEC_SOLO)*factor;
-  pulsePeriodCurrentSec += PULSE_PERIOD_SMOOTH_ALPHA*(pulseTarget - pulsePeriodCurrentSec);
-  if(pulsePeriodCurrentSec < pulseMin) pulsePeriodCurrentSec=pulseMin;
-  if(pulsePeriodCurrentSec > PULSE_PERIOD_MAX_SEC_SOLO) pulsePeriodCurrentSec=PULSE_PERIOD_MAX_SEC_SOLO;
-  fireflyFreq = 1.0f / pulsePeriodCurrentSec;
-
-  // Colori
-  float colorMin = (peerCount==0) ? COLOR_CYCLE_PERIOD_MIN_SEC_SOLO : COLOR_CYCLE_PERIOD_MIN_SEC_PEER;
-  float cycleTarget = COLOR_CYCLE_PERIOD_MAX_SEC_SOLO + (colorMin - COLOR_CYCLE_PERIOD_MAX_SEC_SOLO)*factor;
-  colorCyclePeriodCurrentSec += COLOR_CYCLE_PERIOD_SMOOTH_ALPHA*(cycleTarget - colorCyclePeriodCurrentSec);
-  if(colorCyclePeriodCurrentSec < colorMin) colorCyclePeriodCurrentSec = colorMin;
-  if(colorCyclePeriodCurrentSec > COLOR_CYCLE_PERIOD_MAX_SEC_SOLO) colorCyclePeriodCurrentSec=COLOR_CYCLE_PERIOD_MAX_SEC_SOLO;
+// ---------- Neighbor phase (media vettoriale) ----------
+bool computeNeighborPhaseMean(float& outPhase){
+  float sx=0.0f, sy=0.0f, wsum=0.0f;
+  for(int i=0;i<MAX_PEERS;i++){
+    if(!peers[i].valid || !peers[i].phaseValid) continue;
+    float w = rssiToWeight(peers[i].lastRSSI);
+    float ang = peers[i].phase * TWO_PI;
+    sx += cosf(ang)*w;
+    sy += sinf(ang)*w;
+    wsum += w;
+  }
+  if(wsum <= 0.0f) return false;
+  float ang = atan2f(sy, sx);
+  if(ang < 0) ang += TWO_PI;
+  outPhase = ang / TWO_PI;
+  return true;
 }
 
-// --- Leader re-election ---
+// ---------- Periodi dinamici ----------
+void updateDynamicPeriods(uint8_t peerCount){
+  if(peerCount==0){
+    // Solo mode
+    float pulseTarget = PULSE_PERIOD_MAX_SEC_SOLO + (PULSE_PERIOD_MIN_SEC_SOLO - PULSE_PERIOD_MAX_SEC_SOLO)*presenceFactor;
+    pulsePeriodCurrentSec += PULSE_PERIOD_SMOOTH_ALPHA*(pulseTarget - pulsePeriodCurrentSec);
+    pulsePeriodCurrentSec = constrain(pulsePeriodCurrentSec, PULSE_PERIOD_MIN_SEC_SOLO, PULSE_PERIOD_MAX_SEC_SOLO);
+    fireflyFreq = 1.0f / pulsePeriodCurrentSec;
+
+    float cycleTarget = COLOR_CYCLE_PERIOD_MAX_SEC_SOLO + (COLOR_CYCLE_PERIOD_MIN_SEC_SOLO - COLOR_CYCLE_PERIOD_MAX_SEC_SOLO)*presenceFactor;
+    colorCyclePeriodCurrentSec += COLOR_CYCLE_PERIOD_SMOOTH_ALPHA*(cycleTarget - colorCyclePeriodCurrentSec);
+    colorCyclePeriodCurrentSec = constrain(colorCyclePeriodCurrentSec, COLOR_CYCLE_PERIOD_MIN_SEC_SOLO, COLOR_CYCLE_PERIOD_MAX_SEC_SOLO);
+  } else {
+    // Peer mode sincronizzato
+    float pulseTarget = (peerCount>=2) ? PULSE_PERIOD_PEER_SEC : 1.20f;
+    pulsePeriodCurrentSec += PULSE_PERIOD_SMOOTH_ALPHA*(pulseTarget - pulsePeriodCurrentSec);
+    pulsePeriodCurrentSec = constrain(pulsePeriodCurrentSec, PULSE_PERIOD_PEER_SEC, PULSE_PERIOD_MAX_SEC_SOLO);
+    fireflyFreq = 1.0f / pulsePeriodCurrentSec;
+
+    float cycleTarget = COLOR_CYCLE_PERIOD_PEER_SEC;
+    colorCyclePeriodCurrentSec += COLOR_CYCLE_PERIOD_SMOOTH_ALPHA*(cycleTarget - colorCyclePeriodCurrentSec);
+    colorCyclePeriodCurrentSec = constrain(colorCyclePeriodCurrentSec, COLOR_CYCLE_PERIOD_PEER_SEC, COLOR_CYCLE_PERIOD_MAX_SEC_SOLO);
+  }
+}
+
+// ---------- Leader re-election ----------
 void reevaluateLeaderIfNeeded(uint32_t nowMs){
   bool leaderValid=false;
   if(currentLeaderID==myID) leaderValid=true;
@@ -475,35 +517,40 @@ void reevaluateLeaderIfNeeded(uint32_t nowMs){
   }
 }
 
-// --- LED init ---
-void initLeds(){
-  strip.begin(); strip.clear(); strip.setBrightness(255); strip.show();
-  uint32_t now=millis();
-  for(int k=0;k<NUM_LEDS;k++){
-    int i=SEQ[k];
-    if(LED_PHASE_OFFSET_ENABLED)
-      ledStates[i].baseOffset = (float)k/(float)NUM_LEDS;
-    else
-      ledStates[i].baseOffset = 0.0f;
-    ledStates[i].driftOffset = 0.0f;
-    ledStates[i].nextDriftUpdate = now + PHASE_DRIFT_INTERVAL_MS + (esp_random()%700);
-    ledStates[i].seed = esp_random();
-    coldHueCurrent[i]=rand8range(COLD_MIN_HUE,COLD_MAX_HUE);
-    coldHueNextChangeMs[i]=now + ZERO_PEER_BASE_INTERVAL_MS +
-                           (esp_random() % (ZERO_PEER_COLOR_JITTER_MS+1));
+// ---------- Group hue ----------
+void updateGroupHue(uint8_t peerCount){
+  if(peerCount==0){
+    if(millis()-lastSoloHueDriftMs > 1800){
+      lastSoloHueDriftMs=millis();
+      int8_t step=(int8_t)rand8range(0,2)-1;
+      groupHueLocal=clampCold(hueAdd(groupHueLocal, step));
+    }
+    groupHueTarget=groupHueLocal;
+  }else{
+    int8_t d=hueDiffSigned(groupHueTarget,groupHueLocal);
+    float step=d*GROUP_HUE_COUPLING;
+    if(step>6) step=6; if(step<-6) step=-6;
+    groupHueLocal=hueAdd(groupHueLocal,(int16_t)lroundf(step));
   }
-  computeTargetPalette();
-  scheduleBlackoutForCycle();
-  for(int i=0;i<NUM_LEDS;i++){
-    currentHueDisplay[i]=targetCycleHue[i];
-    prevCycleHue[i]=targetCycleHue[i];
-  }
-  fadeActive=false;
-  lastCycleChangeMs=now;
-  lastColorCycleTickMs=now;
 }
 
-// --- Advertising ---
+// ---------- Timer ciclo colori ----------
+void leaderColorCycleTimer(uint32_t nowMs,bool peerMode){
+  if(!peerMode) return;
+  if(!isLeader) return;
+  uint32_t intervalMs=(uint32_t)(colorCyclePeriodCurrentSec*1000.0f);
+  if(nowMs - lastColorCycleTickMs >= intervalMs){
+    lastColorCycleTickMs += intervalMs;
+    if(nowMs - lastColorCycleTickMs > intervalMs) lastColorCycleTickMs=nowMs;
+    advanceColorCycle(nowMs);
+  }
+  if(nowMs - lastCycleChangeMs > (2*intervalMs)){
+    lastColorCycleTickMs=nowMs;
+    advanceColorCycle(nowMs);
+  }
+}
+
+// ---------- Advertising ----------
 void buildAdvPayload(uint8_t p[12]){
   p[0]=(uint8_t)(COMPANY_ID & 0xFF);
   p[1]=(uint8_t)(COMPANY_ID >> 8);
@@ -524,7 +571,7 @@ void setupAdvertising(){
   gAdv->setAdvertisementData(adv);
   gAdv->start();
 }
-void updateAdvertisingData(bool force=false){
+void updateAdvertisingData(bool force){
   if(!gAdv) return;
   uint32_t now=millis();
   if(!force && (now - lastAdvUpdateMs) < ADV_UPDATE_INTERVAL_MS) return;
@@ -535,40 +582,71 @@ void updateAdvertisingData(bool force=false){
   gAdv->setAdvertisementData(adv);
 }
 
-// --- Timer color cycle ---
-void leaderColorCycleTimer(uint32_t nowMs,bool peerMode){
-  if(!peerMode) return;
-  if(!isLeader) return;
-  uint32_t intervalMs=(uint32_t)(colorCyclePeriodCurrentSec*1000.0f);
-  if(nowMs - lastColorCycleTickMs >= intervalMs){
-    lastColorCycleTickMs += intervalMs;
-    if(nowMs - lastColorCycleTickMs > intervalMs) lastColorCycleTickMs=nowMs;
-    advanceColorCycle(nowMs);
-  }
-  if(nowMs - lastCycleChangeMs > (2*intervalMs)){
-    lastColorCycleTickMs=nowMs;
-    advanceColorCycle(nowMs);
-  }
-}
+// ---------- Scan callback ----------
+class PeerScanCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) override {
+    int8_t rssi=dev.getRSSI();
+    if(rssi < PEER_RSSI_CUTOFF_DBM) return;
+    if(!dev.haveManufacturerData()) return;
+    String md=dev.getManufacturerData();
+    if(md.length() < 12) return;
+    const uint8_t* m=(const uint8_t*)md.c_str();
+    uint16_t cid=m[0]|(m[1]<<8);
+    if(cid!=COMPANY_ID) return;
+    if(m[2]!='B'||m[3]!='D'||m[4]!='G') return;
 
-// --- Group hue ---
-void updateGroupHue(uint8_t peerCount){
-  if(peerCount==0){
-    if(millis()-lastSoloHueDriftMs > 1800){
-      lastSoloHueDriftMs=millis();
-      int8_t step=(int8_t)rand8range(0,2)-1;
-      groupHueLocal=clampCold(hueAdd(groupHueLocal, step));
+    uint8_t peerProto=m[5];
+    uint8_t peerID   =m[6];
+
+    int slot=findPeerSlot(dev.getAddress());
+    if(slot<0) return;
+    bool wasValid=peers[slot].valid;
+
+    peers[slot].addr     = dev.getAddress();
+    peers[slot].lastRSSI = rssi;
+    peers[slot].lastSeen = millis();
+    peers[slot].valid    = true;
+    peers[slot].peerID   = peerID;
+
+    uint8_t phaseByte=m[7];
+    peers[slot].phase=(float)phaseByte/255.0f;
+    peers[slot].phaseValid=true;
+
+    if(peerProto>=6){
+      uint16_t peerCycle=(uint16_t)m[9] | ((uint16_t)m[10]<<8);
+      peers[slot].colorCycle=peerCycle;
+      peers[slot].cycleValid=true;
+      if(peerCycle > warmColorCycle){
+        adoptColorCycle(peerCycle, millis());
+      }
+    } else {
+      peers[slot].cycleValid=false;
     }
-    groupHueTarget=groupHueLocal;
-  }else{
-    int8_t d=hueDiffSigned(groupHueTarget,groupHueLocal);
-    float step=d*GROUP_HUE_COUPLING;
-    if(step>6) step=6; if(step<-6) step=-6;
-    groupHueLocal=hueAdd(groupHueLocal,(int16_t)lroundf(step));
+
+    if(peerID < currentLeaderID){
+      currentLeaderID=peerID;
+      isLeader=(myID == currentLeaderID);
+    }
+
+    neighborPhaseAvailable=true;
+
+    if(!wasValid){
+      triggerNewPeerBlackout(millis());
+    }
   }
+};
+
+// ---------- Continuous scan ----------
+void setupContinuousScan(){
+  BLEScan* scan=BLEDevice::getScan();
+  scan->setAdvertisedDeviceCallbacks(new PeerScanCallbacks(), true);
+  scan->setActiveScan(true);
+  scan->setInterval(120);
+  scan->setWindow(120);
+  scan->start(0,nullptr);
 }
 
-// --- Solo cold update ---
+// ---------- Solo cold update ----------
 void updateSoloColdColors(uint32_t now){
   for(int i=0;i<NUM_LEDS;i++){
     if(now >= coldHueNextChangeMs[i]){
@@ -579,48 +657,37 @@ void updateSoloColdColors(uint32_t now){
   }
 }
 
-// --- Phase drift update ---
-void updatePhaseDrift(uint32_t now, float factor){
-  if(!ENABLE_PEER_PHASE_DRIFT || factor<=0.0f) {
-    for(int i=0;i<NUM_LEDS;i++) ledStates[i].driftOffset=0.0f;
-    return;
+// ---------- Init LED ----------
+void initLeds(){
+  strip.begin(); strip.clear(); strip.setBrightness(255); strip.show();
+  uint32_t now=millis();
+  // rank map per sweep progressivo
+  for(int k=0;k<NUM_LEDS;k++){
+    rankOfLed[ SEQ[k] ] = k;
   }
+  for(int k=0;k<NUM_LEDS;k++){
+    int i=SEQ[k];
+    ledStates[i].baseOffset = LED_PHASE_OFFSET_ENABLED ? (float)k/(float)NUM_LEDS : 0.0f;
+    ledStates[i].driftOffset = 0.0f;
+    ledStates[i].nextDriftUpdate = now + 2000;
+    ledStates[i].seed = 0;
+
+    coldHueCurrent[i]=rand8range(COLD_MIN_HUE,COLD_MAX_HUE);
+    coldHueNextChangeMs[i]= now + ZERO_PEER_BASE_INTERVAL_MS +
+                           (esp_random() % (ZERO_PEER_COLOR_JITTER_MS+1));
+  }
+  computeTargetPalette();
+  scheduleBlackoutForCycle();
   for(int i=0;i<NUM_LEDS;i++){
-    if(now >= ledStates[i].nextDriftUpdate){
-      // nuova deriva piccola
-      float sign = ((ledStates[i].seed ^ prngNext()) & 1)? 1.0f : -1.0f;
-      float mag  = ((prngNext() & 0xFFFF) / 65535.0f) * PHASE_DRIFT_MAX_DELTA * factor;
-      ledStates[i].driftOffset = sign * mag;
-      ledStates[i].nextDriftUpdate = now + PHASE_DRIFT_INTERVAL_MS +
-                                     (prngNext() % 900);
-    }
+    currentHueDisplay[i]=targetCycleHue[i];
+    prevCycleHue[i]=targetCycleHue[i];
   }
+  fadeActive=false;
+  lastCycleChangeMs=now;
+  lastColorCycleTickMs=now;
 }
 
-// --- Hue wobble ---
-uint8_t applyHueWobble(uint8_t baseHue, float phase, uint32_t seed, float factor){
-  if(!ENABLE_HUE_WOBBLE || factor<=0.0f) return baseHue;
-  float w = sinf(phase* TWO_PI + (seed & 0xFF)*0.0245436926f); // seed-based
-  int8_t wob = (int8_t) lroundf(w * (HUE_WOBBLE_MAX * factor));
-  return (uint8_t)(baseHue + wob); // warp (wrap automatic in rendering via 8 bit)
-}
-
-// --- RSSI logging (optional) ---
-#if PEER_RSSI_DEBUG
-void printPeerRSSI(){
-  uint8_t count=countValidPeers();
-  if(count==0){ Serial.println("[PEERS] none"); return; }
-  for(int i=0;i<MAX_PEERS;i++){
-    if(!peers[i].valid) continue;
-    Serial.print("#"); Serial.print(i);
-    Serial.print(" RSSI="); Serial.print(peers[i].lastRSSI);
-    Serial.print(" ID="); Serial.print(peers[i].peerID);
-    Serial.print(" MAC="); Serial.println(peers[i].addr.toString().c_str());
-  }
-}
-#endif
-
-// --- Update LEDs ---
+// ---------- Rendering ----------
 void updateLeds(uint32_t nowMs, float dt){
   float raw=computePresenceRaw();
   reevaluateLeaderIfNeeded(nowMs);
@@ -640,11 +707,16 @@ void updateLeds(uint32_t nowMs, float dt){
   }
   previousPresence=presenceFactor;
 
+  // Aggiorna media fase neighbor
+  float meanPhaseTmp=0.0f;
+  neighborPhaseAvailable = computeNeighborPhaseMean(meanPhaseTmp);
+  if(neighborPhaseAvailable) neighborMeanPhase = meanPhaseTmp;
+
   float prevPhase=fireflyPhase;
   fireflyPhase += fireflyFreq * dt;
   fireflyPhase = wrap01(fireflyPhase);
   if(!soloMode && neighborPhaseAvailable){
-    float eff=0.18f*(0.4f + 0.6f*presenceFactor);
+    float eff=0.30f*(0.4f + 0.6f*presenceFactor);
     float diff=phaseDiff(neighborMeanPhase, fireflyPhase);
     fireflyPhase=wrap01(fireflyPhase + diff*eff);
   }
@@ -655,9 +727,9 @@ void updateLeds(uint32_t nowMs, float dt){
 
   updateFade(nowMs, peerCount);
 
-  // Blackout ciclico
+  // Blackout ciclico (disattivato durante burst nuovo peer)
   if(!soloMode){
-    if(blackoutScheduled && !blackoutActive){
+    if(!newPeerBurstActive && blackoutScheduled && !blackoutActive){
       bool crossed=false;
       if(prevPhase <= blackoutPhase){
         if(fireflyPhase >= blackoutPhase) crossed=true;
@@ -672,32 +744,40 @@ void updateLeds(uint32_t nowMs, float dt){
     if(blackoutActive && nowMs >= blackoutEndMs){
       blackoutActive=false;
       startPostFlash(nowMs);
+      // Se siamo in burst nuovo peer, programma il prossimo colpo
+      if(newPeerBurstActive){
+        newPeerNextStartMs = postFlashEndMs + NEW_PEER_BURST_GAP_MS;
+      }
     }
   } else {
     if(blackoutActive){ blackoutActive=false; startPostFlash(nowMs); }
   }
   updatePostFlash(nowMs);
 
-  // Peak target
-  float factor=(peerCount >= MAX_PEER_ACCEL_PEERS)?1.0f:(float)peerCount/MAX_PEER_ACCEL_PEERS;
-  float targetPeak = soloMode ? ZERO_PEER_PEAK : (factor * PEAK_SCALE_MAX);
-  if(targetPeak > 1.35f) targetPeak=1.35f;
+  // Pianifica successivi colpi della burst nuovo peer
+  if(newPeerBurstActive){
+    if(!blackoutActive && !postFlashActive){
+      if(newPeerBurstRemaining>0 && nowMs >= newPeerNextStartMs){
+        blackoutActive=true;
+        blackoutEndMs=nowMs + BLACKOUT_NEW_PEER_DURATION_MS;
+        newPeerBurstRemaining--;
+      } else if(newPeerBurstRemaining==0){
+        newPeerBurstActive=false;
+      }
+    }
+  }
 
+  // Peak target
+  float targetPeak = soloMode ? ZERO_PEER_PEAK : 1.0f;
   float alpha=PEAK_SMOOTH_ALPHA;
   if(targetPeak < smoothedPeak) alpha *= PEAK_SMOOTH_ALPHA_FALL_MULT;
   smoothedPeak += alpha*(targetPeak - smoothedPeak);
-  smoothedPeak = constrain(smoothedPeak, 0.0f, 1.4f);
+  smoothedPeak = constrain(smoothedPeak, 0.0f, PEAK_SCALE_MAX);
 
-  // Phase drift & wobble updates
-  updatePhaseDrift(nowMs, factor);
-
-  // Global shimmer
-  float globalShimmer = 1.0f;
-  if(!soloMode && ENABLE_PEER_GLOBAL_SHIMMER){
-    float sg = sinf(fireflyPhase * TWO_PI);
-    globalShimmer = 1.0f + PEER_GLOBAL_SHIMMER_DEPTH * sg;
-    if(globalShimmer < 0) globalShimmer=0;
-  }
+  // Direzione sweep alternata per ciclo
+  float c = fireflyPhase * SWEEP_SPEED_MULT;
+  if(((warmColorCycle & 1) == 1)) c = 1.0f - c;
+  c = wrap01(c);
 
   // Render
   for(int i=0;i<NUM_LEDS;i++){
@@ -708,56 +788,57 @@ void updateLeds(uint32_t nowMs, float dt){
       uint8_t v=(uint8_t)lroundf(POST_FLASH_FIXED_INTENSITY * 255.0f);
       out = strip.Color(v,v,v);
     } else {
-      float phase_i = wrap01(fireflyPhase + ledStates[i].baseOffset + ledStates[i].driftOffset);
-      float wave = (sinf(phase_i * TWO_PI) + 1.0f)*0.5f; // 0..1
-      float valFrac = wave * smoothedPeak * globalShimmer;
+      float valFrac=0.0f;
 
-      if(!soloMode && ENABLE_PEER_PIXEL_SHIMMER){
-        float sh=sinf((fireflyPhase*TWO_PI*SHIMMER_FREQ_MULT) + i*SHIMMER_PHASE_SPREAD);
-        float pixelShimmer = 1.0f + PEER_PIXEL_SHIMMER_DEPTH * sh * factor;
-        if(pixelShimmer<0) pixelShimmer=0;
-        valFrac *= pixelShimmer;
-      }
-
-      if(!soloMode && ENABLE_PEER_MICRO_SPARKLE && wave > SPARKLE_WAVE_THRESHOLD){
-        uint32_t r=esp_random();
-        float jitter = ((r & 0x3FF)/1023.0f) - 0.5f; // -0.5..0.5
-        valFrac += jitter * (factor * PEER_MICRO_SPARKLE_MAX);
+      if(soloMode){
+        float phase_i = wrap01(fireflyPhase + ledStates[i].baseOffset);
+        float wave = (sinf(phase_i * TWO_PI) + 1.0f)*0.5f;
+        valFrac = wave * smoothedPeak;
+      } else {
+        float idxNorm = (float)rankOfLed[i] / (float)NUM_LEDS;
+        float env = 0.0f;
+        for(int s=0;s<SWEEP_COUNT;s++){
+          float center = wrap01(c + (s * (1.0f / SWEEP_COUNT)));
+          float d = fabs(idxNorm - center);
+          if(d > 0.5f) d = 1.0f - d;
+          float e = 1.0f - (d / SWEEP_WIDTH);
+          if(e < 0.0f) e = 0.0f;
+          e = e*e;
+          if(e > env) env = e;
+        }
+        float gate = (1.0f - SWEEP_MIX) + SWEEP_MIX * env;
+        valFrac = smoothedPeak * gate;
       }
 
       if(valFrac<0) valFrac=0;
       if(valFrac>1) valFrac=1;
 
       uint8_t baseHue = soloMode ? coldHueCurrent[i] : currentHueDisplay[i];
-      if(!soloMode){
-        baseHue = applyHueWobble(baseHue, fireflyPhase, ledStates[i].seed, factor);
-      }
-
       uint16_t hue16 = (uint16_t)baseHue * 257;
-      uint8_t S=255;
-      uint8_t V=(uint8_t)lroundf(valFrac*255.0f);
-      out=strip.ColorHSV(hue16,S,V);
+
+      float brightnessScale = soloMode ? 1.0f : COLOR_BRIGHTNESS_SCALE;
+      uint8_t  V=(uint8_t)lroundf(valFrac * brightnessScale * 255.0f);
+
+      out=strip.ColorHSV(hue16, 255, V);
     }
     strip.setPixelColor(i,out);
   }
   strip.show();
 
-  if(bloomActive && nowMs > bloomEndMs) bloomActive=false;
+  if(bloomActive && nowMs > BLOOM_DURATION_MS) bloomActive=false;
 
   if(nowMs - lastStatusLogMs > STATUS_LOG_INTERVAL_MS){
     lastStatusLogMs=nowMs;
     Serial.print("[STATUS] peers="); Serial.print(peerCount);
-    Serial.print(" factor="); Serial.print((peerCount>=MAX_PEER_ACCEL_PEERS)?1.0f:(float)peerCount/MAX_PEER_ACCEL_PEERS,2);
     Serial.print(" cycle="); Serial.print((unsigned long)warmColorCycle);
-    Serial.print(" pulsePeriod="); Serial.print(pulsePeriodCurrentSec,2);
-    Serial.print("s colorPeriod="); Serial.print(colorCyclePeriodCurrentSec,2);
+    Serial.print(" pulse="); Serial.print(pulsePeriodCurrentSec,2);
+    Serial.print("s color="); Serial.print(colorCyclePeriodCurrentSec,2);
     Serial.print("s peak="); Serial.print(smoothedPeak,2);
     Serial.print(" blackout="); Serial.print(blackoutActive);
     Serial.print(" flash="); Serial.print(postFlashActive);
+    Serial.print(" npBurst="); Serial.print(newPeerBurstActive);
+    Serial.print("/"); Serial.print(newPeerBurstRemaining);
     Serial.println();
-#if PEER_RSSI_DEBUG
-    printPeerRSSI();
-#endif
 #ifdef COLOR_DEBUG
     Serial.print("HUES: ");
     for(int j=0;j<NUM_LEDS;j++){ Serial.print(currentHueDisplay[j]); Serial.print(' '); }
@@ -766,68 +847,7 @@ void updateLeds(uint32_t nowMs, float dt){
   }
 }
 
-// --- Scan callback ---
-class PeerScanCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice dev) override {
-    int8_t rssi=dev.getRSSI();
-    if(rssi < PEER_RSSI_CUTOFF_DBM) return;
-    if(!dev.haveManufacturerData()) return;
-    String md=dev.getManufacturerData();
-    if(md.length() < 9) return;
-    const uint8_t* m=(const uint8_t*)md.c_str();
-    uint16_t cid=m[0]|(m[1]<<8);
-    if(cid!=COMPANY_ID) return;
-    if(m[2]!='B'||m[3]!='D'||m[4]!='G') return;
-    uint8_t peerProto=m[5];
-    uint8_t peerID=m[6];
-
-    int slot=findPeerSlot(dev.getAddress());
-    if(slot<0) return;
-    bool wasValid=peers[slot].valid;
-
-    peers[slot].addr     = dev.getAddress();
-    peers[slot].lastRSSI = rssi;
-    peers[slot].lastSeen = millis();
-    peers[slot].valid    = true;
-    peers[slot].peerID   = peerID;
-
-    uint8_t phaseByte=m[7];
-    peers[slot].phase=(float)phaseByte/255.0f;
-    peers[slot].phaseValid=true;
-
-    if(peerProto>=6 && md.length()>=12){
-      uint16_t peerCycle=(uint16_t)m[9] | ((uint16_t)m[10]<<8);
-      peers[slot].colorCycle=peerCycle;
-      peers[slot].cycleValid=true;
-      if(peerCycle > warmColorCycle){
-        adoptColorCycle(peerCycle, millis());
-      }
-    } else {
-      peers[slot].cycleValid=false;
-    }
-
-    if(peerID < currentLeaderID){
-      currentLeaderID=peerID;
-      isLeader=(myID == currentLeaderID);
-    }
-    neighborPhaseAvailable=true;
-
-    if(!wasValid){
-      triggerNewPeerBlackout(millis());
-    }
-  }
-};
-
-void setupContinuousScan(){
-  BLEScan* scan=BLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(new PeerScanCallbacks(), true);
-  scan->setActiveScan(true);
-  scan->setInterval(120);
-  scan->setWindow(120);
-  scan->start(0,nullptr);
-}
-
-// --- BLE util ---
+// ---------- BLE util ----------
 uint8_t deriveMyIDFromBLEAddr(){
   String addr=BLEDevice::getAddress().toString();
   int pos=addr.lastIndexOf(':');
@@ -840,7 +860,7 @@ uint8_t deriveMyIDFromBLEAddr(){
   return v;
 }
 
-// --- Setup / Loop ---
+// ---------- Setup / Loop ----------
 void setup(){
   Serial.begin(115200);
   delay(120);
@@ -862,7 +882,7 @@ void loop(){
     float dt = (lastFrameMs==0)? (FRAME_INTERVAL_MS/1000.0f):(now - lastFrameMs)/1000.0f;
     lastFrameMs=now;
     updateLeds(now, dt);
-    updateAdvertisingData();
+    updateAdvertisingData(false);
   }
   delay(1);
 }
